@@ -1,0 +1,723 @@
+import discord
+from discord.ext import commands, tasks
+from discord import app_commands
+import json
+import os
+import asyncio
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+
+# =========================================================
+# إعدادات البوت
+# =========================================================
+
+TOKEN = "MTQ0MjI4NzkyMjI4Njk1NjU2NA.GhcQEM._J43TDrHHtGLq_WJloAoLWUd-ve-AV4yl2ipGk"
+
+# ضع ID الشخصين المسموح لهم باستخدام البوت
+ALLOWED_USERS = [
+    111111111111111111,  # الشخص الأول
+    1169543549990228060   # الشخص الثاني
+]
+
+# توقيت الجزائر
+TIMEZONE = ZoneInfo("Africa/Algiers")
+
+DATA_FILE = "reminders.json"
+
+
+# =========================================================
+# INTENTS
+# =========================================================
+
+intents = discord.Intents.default()
+intents.members = True
+
+bot = commands.Bot(
+    command_prefix="!",
+    intents=intents
+)
+
+
+# =========================================================
+# البيانات
+# =========================================================
+
+def default_data():
+    return {
+        "reminders": [],
+        "log_channel": None,
+        "next_id": 1
+    }
+
+
+def load_data():
+    if not os.path.exists(DATA_FILE):
+        return default_data()
+
+    try:
+        with open(DATA_FILE, "r", encoding="utf-8") as file:
+            return json.load(file)
+    except (json.JSONDecodeError, OSError):
+        return default_data()
+
+
+data = load_data()
+
+
+def save_data():
+    with open(DATA_FILE, "w", encoding="utf-8") as file:
+        json.dump(data, file, ensure_ascii=False, indent=4)
+
+
+# =========================================================
+# الصلاحيات
+# =========================================================
+
+def allowed(user_id: int) -> bool:
+    return user_id in ALLOWED_USERS
+
+
+# =========================================================
+# الأيام
+# =========================================================
+
+DAYS = {
+    "الاثنين": 0,
+    "الثلاثاء": 1,
+    "الأربعاء": 2,
+    "الخميس": 3,
+    "الجمعة": 4,
+    "السبت": 5,
+    "الأحد": 6
+}
+
+
+# =========================================================
+# حساب الموعد القادم
+# =========================================================
+
+def get_next_date(day_name: str, hour: int, minute: int):
+    now = datetime.now(TIMEZONE)
+
+    target_weekday = DAYS[day_name]
+
+    days_ahead = (target_weekday - now.weekday()) % 7
+
+    target = now + timedelta(days=days_ahead)
+
+    target = target.replace(
+        hour=hour,
+        minute=minute,
+        second=0,
+        microsecond=0
+    )
+
+    if target <= now:
+        target += timedelta(days=7)
+
+    return target
+
+
+# =========================================================
+# LOG
+# =========================================================
+
+async def send_log(guild: discord.Guild, message: str):
+    channel_id = data.get("log_channel")
+
+    if not channel_id:
+        return
+
+    channel = guild.get_channel(channel_id)
+
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(channel_id)
+        except discord.DiscordException:
+            return
+
+    embed = discord.Embed(
+        title="📋 سجل التذكيرات",
+        description=message,
+        color=discord.Color.blurple(),
+        timestamp=datetime.now(TIMEZONE)
+    )
+
+    try:
+        await channel.send(embed=embed)
+    except discord.DiscordException:
+        pass
+
+
+# =========================================================
+# إدخال الساعة
+# =========================================================
+
+class TimeModal(discord.ui.Modal, title="تحديد وقت التذكير"):
+
+    time_input = discord.ui.TextInput(
+        label="الساعة",
+        placeholder="مثال: 20:00",
+        required=True,
+        max_length=5
+    )
+
+    def __init__(self, reminder):
+        super().__init__()
+        self.reminder = reminder
+
+    async def on_submit(self, interaction: discord.Interaction):
+
+        value = self.time_input.value.strip()
+
+        try:
+            parts = value.split(":")
+
+            if len(parts) != 2:
+                raise ValueError
+
+            hour = int(parts[0])
+            minute = int(parts[1])
+
+            if hour < 0 or hour > 23:
+                raise ValueError
+
+            if minute < 0 or minute > 59:
+                raise ValueError
+
+        except ValueError:
+            await interaction.response.send_message(
+                "❌ الوقت غير صحيح.\nاكتب الوقت بهذا الشكل: `20:00`",
+                ephemeral=True
+            )
+            return
+
+        self.reminder["hour"] = hour
+        self.reminder["minute"] = minute
+
+        await interaction.response.send_message(
+            "🎯 الآن اختر الرتبة:",
+            view=RoleView(self.reminder),
+            ephemeral=True
+        )
+
+
+# =========================================================
+# اختيار اليوم
+# =========================================================
+
+class DaySelect(discord.ui.Select):
+
+    def __init__(self, reminder):
+        self.reminder = reminder
+
+        options = [
+            discord.SelectOption(label="السبت", value="السبت"),
+            discord.SelectOption(label="الأحد", value="الأحد"),
+            discord.SelectOption(label="الاثنين", value="الاثنين"),
+            discord.SelectOption(label="الثلاثاء", value="الثلاثاء"),
+            discord.SelectOption(label="الأربعاء", value="الأربعاء"),
+            discord.SelectOption(label="الخميس", value="الخميس"),
+            discord.SelectOption(label="الجمعة", value="الجمعة")
+        ]
+
+        super().__init__(
+            placeholder="📅 اختر اليوم",
+            options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+
+        if not allowed(interaction.user.id):
+            await interaction.response.send_message(
+                "❌ ليس لديك صلاحية.",
+                ephemeral=True
+            )
+            return
+
+        self.reminder["day"] = self.values[0]
+
+        await interaction.response.send_modal(
+            TimeModal(self.reminder)
+        )
+
+
+class DayView(discord.ui.View):
+
+    def __init__(self, reminder):
+        super().__init__(timeout=120)
+        self.add_item(DaySelect(reminder))
+
+
+# =========================================================
+# اختيار الرتبة
+# =========================================================
+
+class RoleSelect(discord.ui.RoleSelect):
+
+    def __init__(self, reminder):
+        self.reminder = reminder
+
+        super().__init__(
+            placeholder="🎯 اختر الرتبة",
+            min_values=1,
+            max_values=1
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+
+        if not allowed(interaction.user.id):
+            await interaction.response.send_message(
+                "❌ ليس لديك صلاحية.",
+                ephemeral=True
+            )
+            return
+
+        role = self.values[0]
+
+        if role.is_default():
+            await interaction.response.send_message(
+                "❌ لا يمكنك اختيار رتبة @everyone.",
+                ephemeral=True
+            )
+            return
+
+        self.reminder["role_id"] = role.id
+        self.reminder["role_name"] = role.name
+
+        target = get_next_date(
+            self.reminder["day"],
+            self.reminder["hour"],
+            self.reminder["minute"]
+        )
+
+        reminder_id = data["next_id"]
+        data["next_id"] += 1
+
+        new_reminder = {
+            "id": reminder_id,
+            "guild_id": interaction.guild.id,
+            "message": self.reminder["message"],
+            "day": self.reminder["day"],
+            "hour": self.reminder["hour"],
+            "minute": self.reminder["minute"],
+            "role_id": role.id,
+            "role_name": role.name,
+            "next_run": target.isoformat(),
+            "created_by": interaction.user.id,
+            "active": True
+        }
+
+        data["reminders"].append(new_reminder)
+        save_data()
+
+        embed = discord.Embed(
+            title="✅ تم إنشاء التذكير",
+            color=discord.Color.green()
+        )
+
+        embed.add_field(
+            name="🆔 رقم التذكير",
+            value=f"`{reminder_id}`",
+            inline=True
+        )
+
+        embed.add_field(
+            name="🎯 الرتبة",
+            value=role.mention,
+            inline=True
+        )
+
+        embed.add_field(
+            name="📅 الموعد",
+            value=target.strftime("%Y-%m-%d %H:%M"),
+            inline=False
+        )
+
+        embed.add_field(
+            name="💬 الرسالة",
+            value=self.reminder["message"],
+            inline=False
+        )
+
+        await interaction.response.send_message(
+            embed=embed,
+            ephemeral=True
+        )
+
+        await send_log(
+            interaction.guild,
+            (
+                f"👤 **أنشأ التذكير:** {interaction.user.mention}\n"
+                f"🆔 **رقم التذكير:** `{reminder_id}`\n"
+                f"🎯 **الرتبة:** {role.mention}\n"
+                f"📅 **الموعد:** `{target.strftime('%Y-%m-%d %H:%M')}`\n"
+                f"💬 **الرسالة:** {self.reminder['message']}"
+            )
+        )
+
+
+class RoleView(discord.ui.View):
+
+    def __init__(self, reminder):
+        super().__init__(timeout=120)
+        self.add_item(RoleSelect(reminder))
+
+
+# =========================================================
+# /تذكير
+# =========================================================
+
+@bot.tree.command(
+    name="تذكير",
+    description="إنشاء تذكير جديد"
+)
+@app_commands.describe(
+    message="الرسالة التي سيتم إرسالها"
+)
+async def reminder_command(
+    interaction: discord.Interaction,
+    message: str
+):
+
+    if not allowed(interaction.user.id):
+        await interaction.response.send_message(
+            "❌ ليس لديك صلاحية استخدام هذا الأمر.",
+            ephemeral=True
+        )
+        return
+
+    reminder = {
+        "message": message,
+        "day": None,
+        "hour": None,
+        "minute": None,
+        "role_id": None,
+        "role_name": None
+    }
+
+    await interaction.response.send_message(
+        "📅 اختر اليوم:",
+        view=DayView(reminder),
+        ephemeral=True
+    )
+
+
+# =========================================================
+# /تذكيرات
+# =========================================================
+
+@bot.tree.command(
+    name="تذكيرات",
+    description="عرض التذكيرات"
+)
+async def reminders_command(interaction: discord.Interaction):
+
+    if not allowed(interaction.user.id):
+        await interaction.response.send_message(
+            "❌ ليس لديك صلاحية.",
+            ephemeral=True
+        )
+        return
+
+    reminders = [
+        reminder
+        for reminder in data["reminders"]
+        if reminder["guild_id"] == interaction.guild.id
+        and reminder["active"]
+    ]
+
+    if not reminders:
+        await interaction.response.send_message(
+            "📭 لا توجد تذكيرات نشطة.",
+            ephemeral=True
+        )
+        return
+
+    embed = discord.Embed(
+        title="📋 التذكيرات النشطة",
+        color=discord.Color.blurple()
+    )
+
+    for reminder in reminders:
+
+        target = datetime.fromisoformat(
+            reminder["next_run"]
+        )
+
+        embed.add_field(
+            name=f"🆔 #{reminder['id']} | {reminder['role_name']}",
+            value=(
+                f"📅 {target.strftime('%Y-%m-%d %H:%M')}\n"
+                f"💬 {reminder['message'][:300]}"
+            ),
+            inline=False
+        )
+
+    await interaction.response.send_message(
+        embed=embed,
+        ephemeral=True
+    )
+
+
+# =========================================================
+# /حذف_تذكير
+# =========================================================
+
+@bot.tree.command(
+    name="حذف_تذكير",
+    description="حذف تذكير"
+)
+@app_commands.describe(
+    reminder_id="رقم التذكير"
+)
+async def delete_reminder_command(
+    interaction: discord.Interaction,
+    reminder_id: int
+):
+
+    if not allowed(interaction.user.id):
+        await interaction.response.send_message(
+            "❌ ليس لديك صلاحية.",
+            ephemeral=True
+        )
+        return
+
+    reminder = next(
+        (
+            item for item in data["reminders"]
+            if item["id"] == reminder_id
+            and item["guild_id"] == interaction.guild.id
+            and item["active"]
+        ),
+        None
+    )
+
+    if reminder is None:
+        await interaction.response.send_message(
+            "❌ لم يتم العثور على هذا التذكير.",
+            ephemeral=True
+        )
+        return
+
+    reminder["active"] = False
+    save_data()
+
+    await interaction.response.send_message(
+        f"🗑️ تم حذف التذكير رقم `{reminder_id}`.",
+        ephemeral=True
+    )
+
+    await send_log(
+        interaction.guild,
+        (
+            f"🗑️ **تم حذف تذكير**\n"
+            f"👤 **بواسطة:** {interaction.user.mention}\n"
+            f"🆔 **الرقم:** `{reminder_id}`\n"
+            f"🎯 **الرتبة:** {reminder['role_name']}"
+        )
+    )
+
+
+# =========================================================
+# /لوق
+# =========================================================
+
+@bot.tree.command(
+    name="لوق",
+    description="تحديد روم لوق التذكيرات"
+)
+@app_commands.describe(
+    channel="روم اللوق"
+)
+async def log_command(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel
+):
+
+    if not allowed(interaction.user.id):
+        await interaction.response.send_message(
+            "❌ ليس لديك صلاحية.",
+            ephemeral=True
+        )
+        return
+
+    data["log_channel"] = channel.id
+    save_data()
+
+    await interaction.response.send_message(
+        f"✅ تم تحديد روم اللوق: {channel.mention}",
+        ephemeral=True
+    )
+
+    await send_log(
+        interaction.guild,
+        (
+            f"⚙️ **تم تحديد روم اللوق**\n"
+            f"👤 **بواسطة:** {interaction.user.mention}\n"
+            f"📌 **الروم:** {channel.mention}"
+        )
+    )
+
+
+# =========================================================
+# إرسال التذكير
+# =========================================================
+
+async def execute_reminder(reminder):
+
+    guild = bot.get_guild(reminder["guild_id"])
+
+    if guild is None:
+        return
+
+    role = guild.get_role(reminder["role_id"])
+
+    if role is None:
+        await send_log(
+            guild,
+            (
+                f"❌ فشل إرسال التذكير `{reminder['id']}`\n"
+                f"السبب: الرتبة غير موجودة."
+            )
+        )
+        return
+
+    sent = 0
+    failed = 0
+
+    for member in role.members:
+
+        if member.bot:
+            continue
+
+        try:
+            embed = discord.Embed(
+                title="🔔 تذكير",
+                description=(
+                    f"{member.mention}\n\n"
+                    f"{reminder['message']}"
+                ),
+                color=discord.Color.blurple()
+            )
+
+            embed.set_footer(
+                text=f"تذكير #{reminder['id']}"
+            )
+
+            await member.send(embed=embed)
+
+            sent += 1
+
+        except (
+            discord.Forbidden,
+            discord.HTTPException
+        ):
+            failed += 1
+
+    await send_log(
+        guild,
+        (
+            f"📨 **تم تنفيذ التذكير**\n"
+            f"🆔 **رقم التذكير:** `{reminder['id']}`\n"
+            f"🎯 **الرتبة:** `{role.name}`\n"
+            f"✅ **تم الإرسال:** `{sent}`\n"
+            f"❌ **فشل الإرسال:** `{failed}`"
+        )
+    )
+
+
+# =========================================================
+# فحص التذكيرات
+# =========================================================
+
+@tasks.loop(seconds=30)
+async def reminder_checker():
+
+    now = datetime.now(TIMEZONE)
+
+    changed = False
+
+    for reminder in data["reminders"]:
+
+        if not reminder["active"]:
+            continue
+
+        try:
+            next_run = datetime.fromisoformat(
+                reminder["next_run"]
+            )
+        except (ValueError, TypeError):
+            continue
+
+        if now >= next_run:
+
+            await execute_reminder(reminder)
+
+            next_run = next_run + timedelta(days=7)
+
+            reminder["next_run"] = next_run.isoformat()
+
+            changed = True
+
+    if changed:
+        save_data()
+
+
+@reminder_checker.before_loop
+async def before_reminder_checker():
+    await bot.wait_until_ready()
+
+
+# =========================================================
+# تشغيل البوت
+# =========================================================
+
+@bot.event
+async def on_ready():
+
+    print(f"✅ تم تسجيل الدخول: {bot.user}")
+
+    try:
+        synced = await bot.tree.sync()
+        print(f"✅ تم تسجيل {len(synced)} أمر.")
+    except Exception as error:
+        print(f"❌ خطأ في تسجيل الأوامر: {error}")
+
+    if not reminder_checker.is_running():
+        reminder_checker.start()
+
+
+# =========================================================
+# الأخطاء
+# =========================================================
+
+@bot.tree.error
+async def on_app_command_error(
+    interaction: discord.Interaction,
+    error: app_commands.AppCommandError
+):
+
+    print(f"❌ Command Error: {error}")
+
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                "❌ حدث خطأ أثناء تنفيذ الأمر.",
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                "❌ حدث خطأ أثناء تنفيذ الأمر.",
+                ephemeral=True
+            )
+    except discord.DiscordException:
+        pass
+
+
+# =========================================================
+# تشغيل
+# =========================================================
+
+bot.run(TOKEN)
